@@ -4,9 +4,19 @@
 //
 // 支持三种NFT（Memory、Prompt、Memes），按权重分配PTC奖励。
 // 权重：Prompt=50，Memory=1，Memes=2500。
-// 产出速率:初始速率每10分钟产出160个PTC，按秒产出。
-// 减半周期:每两年产出速率减半。
-// 奖励采用全局积分累加器模型，周期产出+周期内线性插值，近似连续产出。
+// 废除的旧规则：产出速率:初始速率每10分钟产出160个PTC，按秒产出。减半周期:每两年产出速率减半。
+
+// 增加的新规则：
+// 质押挖矿的总数量：30亿
+// 总周期数量：共 6 个周期T1-T6，每个周期是2年，周期内线性释放，一共 12 年发完。
+// 周期T1 释放12亿
+// 周期T2 释放9亿 
+// 周期T3 释放4.5亿
+// 周期T4 释放2.25亿
+// 周期T5 释放1.125亿
+// 周期T6 释放1.125亿
+
+// 奖励采用全局积分累加器模型，近似连续产出。
 // 支持质押/解押/领取奖励单个或批量操作，支持随时领取全部或部分奖励。
 // 支持批量质押和解押NFT，支持同类型和不同类型的批量操作。
 // 支持救援功能，允许合约所有者提取误转入的ERC20代币、ETH和非质押NFT。
@@ -24,9 +34,9 @@ import "@openzeppelin/contracts/token/ERC721/utils/ERC721Holder.sol";
 using SafeERC20 for IERC20;
 
 /// @title PromptStaking
-/// @notice 支持三种NFT的PTC奖励质押合约
 /// @author Thebook
 contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
+    // -------------------- 质押结构体 --------------------
     /// @notice 用户单个NFT质押信息
     struct StakeInfo {
         address nft;        // NFT合约地址
@@ -43,17 +53,23 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         uint256 claimed;        // 累计已领取奖励
     }
 
+    /// @notice 用户质押信息
+    mapping(address => UserInfo) public users;
+
+    /// @notice 质押反向索引，记录每个NFT(tokenId)当前质押所属用户
+    mapping(address => mapping(uint256 => address)) public nftOwners;
+
     // -------------------- 合约参数 --------------------
     IERC20 public immutable ptc;           // PTC代币合约
     address public immutable memoryNFT;    // Memory NFT合约地址
     address public immutable promptNFT;    // Prompt NFT合约地址
     address public immutable memesNFT;     // Memes NFT合约地址
 
-
-    uint256 public constant PERIOD_DURATION = 600;           // 初始奖励速率：时长(10分钟)
-    uint256 public constant INITIAL_REWARD = 160 ether;      // 初始奖励速率：额度(160PTC)
-    uint256 public constant HALVING_INTERVAL = 2 * 365 days; // 每两年速率减半
-    uint256 public constant PRODUCTION_DURATION = 364896000; // 总产出时长364896000秒
+    // Reward schedule: 6 periods (T1..T6), each 2 years, linear release within each period.
+    uint256 public constant SCHEDULE_PERIODS = 6;
+    uint256 public constant SCHEDULE_PERIOD_DURATION = 2 * 365 days; // 2 years per period
+    // Total PTC to release per period (units: wei)
+    uint256[6] public schedulePeriodTotals;
 
     uint256 public startRewardTimestamp; // 奖励产出起始时间
     uint256 public endRewardTimestamp;   // 奖励产出结束时间
@@ -61,8 +77,6 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     uint256 public accRewardPerWeight;   // 全局积分累加器（1e18精度）
     uint256 public lastRewardTimestamp;  // 上次奖励计算时间戳
     uint256 public totalWeight;          // 全局总权重（所有用户权重之和）
-
-    mapping(address => UserInfo) public users; // 用户质押信息
 
     // -------------------- 手续费参数 --------------------
     address public feeRecipient; // 手续费接收地址
@@ -118,10 +132,51 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
             require(_startTime >= block.timestamp, "StartTime must be in the future");
             startRewardTimestamp = _startTime;
         }
-        endRewardTimestamp = startRewardTimestamp + PRODUCTION_DURATION;
-        
+        // Set end timestamp to cover all schedule periods (6 * 2 years = 12 years)
+        endRewardTimestamp = startRewardTimestamp + SCHEDULE_PERIODS * SCHEDULE_PERIOD_DURATION;
+
+        // Initialize schedule totals (单位: 亿 = 100,000,000)
+        // T1: 12亿, T2: 9亿, T3: 4.5亿, T4: 2.25亿, T5: 1.125亿, T6: 1.125亿
+        schedulePeriodTotals[0] = 1200000000 ether; // 12亿
+        schedulePeriodTotals[1] = 900000000 ether;  // 9亿
+        schedulePeriodTotals[2] = 450000000 ether;  // 4.5亿
+        schedulePeriodTotals[3] = 225000000 ether;  // 2.25亿
+        schedulePeriodTotals[4] = 112500000 ether;  // 1.125亿
+        schedulePeriodTotals[5] = 112500000 ether;  // 1.125亿
     }
 
+    // -------------------- 辅助查询函数 ------------------
+    /// @notice 获取用户所有质押NFT列表（分页）
+    /// @param user 用户地址
+    /// @param offset 偏移量
+    /// @param limit 限制数量
+    /// @return stakes 用户所有质押NFT StakeInfo[]
+    function getStakedNFTs(address user, uint256 offset, uint256 limit) external view returns (StakeInfo[] memory stakes) {
+        uint256 total = users[user].stakes.length;
+        if (offset >= total) return new StakeInfo[](0);
+        if (offset + limit > total) limit = total - offset;
+        if (offset == 0 && limit == total) {
+            return users[user].stakes;
+        } else {
+            stakes = new StakeInfo[](limit);
+            for (uint256 i = 0; i < limit; i++) {
+                stakes[i] = users[user].stakes[offset + i];
+            }
+            return stakes;
+        }
+    }
+
+    /// @notice 获取用户质押nft总数量
+    function getStakedNFTsCount(address user) external view returns (uint256) {
+        return users[user].stakes.length;
+    }
+
+    /// @notice 获取质押中的nft的所属用户
+    function getStakedNFTOwner(address nft, uint256 tokenId) external view returns (address) {
+        return nftOwners[nft][tokenId];
+    }
+
+    // -------------------- 核心函数 --------------------
     /// @notice 修饰符：检查NFT是否为支持的三种NFT之一
     modifier onlySupportedNFT(address nft) {
         require(nft == promptNFT || nft == memoryNFT || nft == memesNFT, "Unsupported NFT");
@@ -152,24 +207,31 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         }
         uint256 from = lastRewardTimestamp;
         uint256 to = nowTime;
-        uint256 reward = 0;
-        while (from < to) {
-            // 当前from所在的减半区间的结束时间
-            uint256 halvingIndex = (from - startRewardTimestamp) / HALVING_INTERVAL;
-            uint256 halvingEnd = startRewardTimestamp + (halvingIndex + 1) * HALVING_INTERVAL;
-            if (halvingEnd > to) halvingEnd = to;
-            uint256 rewardPerPeriod = INITIAL_REWARD >> halvingIndex;
-            uint256 duration = halvingEnd - from;
-            // 直接累加这段时间的奖励
-            reward += rewardPerPeriod * duration / PERIOD_DURATION;
-            from = halvingEnd;
-        }
+
+        // Compute total emitted up to 'to' and up to 'from', then take difference.
+        uint256 reward = _emittedUntil(to) - _emittedUntil(from);
         // 计算本次应收手续费
         uint256 fee = reward * feeRate / 1e4;
         pendingFee += fee;
         // 分配给用户
         accRewardPerWeight += (reward - fee) * 1e18 / totalWeight;
         lastRewardTimestamp = nowTime;
+    }
+
+    /// @notice Returns total amount emitted from schedule start up to time `t` 
+    function _emittedUntil(uint256 t) internal view returns (uint256) {
+        if (t <= startRewardTimestamp) return 0;
+        if (t > endRewardTimestamp) t = endRewardTimestamp;
+        uint256 total = 0;
+        uint256 periodDuration = SCHEDULE_PERIOD_DURATION;
+        for (uint256 i = 0; i < SCHEDULE_PERIODS; i++) {
+            uint256 periodStart = startRewardTimestamp + i * periodDuration;
+            if (t <= periodStart) break;
+            uint256 periodEnd = periodStart + periodDuration;
+            uint256 elapsed = t < periodEnd ? t - periodStart : periodDuration;
+            total += schedulePeriodTotals[i] * elapsed / periodDuration;
+        }
+        return total;
     }
 
     /// @notice 更新指定用户的奖励（全局积分累加器模型）
@@ -198,6 +260,8 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         users[msg.sender].weight += weight; // 更新用户权重
         totalWeight += weight; // 更新总权重
 
+    nftOwners[nft][tokenId] = msg.sender;
+
         emit Staked(msg.sender, nft, tokenId); // 触发质押事件
         IERC721(nft).safeTransferFrom(msg.sender, address(this), tokenId); // 转移NFT到合约地址
     }
@@ -211,6 +275,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         for (uint256 i = 0; i < tokenIds.length; i++) {
             uint256 tokenId = tokenIds[i];
             users[msg.sender].stakes.push(StakeInfo(nft, tokenId, block.timestamp));
+            nftOwners[nft][tokenId] = msg.sender;
         }
         users[msg.sender].weight += totalAdd;
         totalWeight += totalAdd;
@@ -230,6 +295,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
             require(_isSupportedNFT(nft), "Unsupported NFT");
             uint256 weight = _getWeight(nft);
             users[msg.sender].stakes.push(StakeInfo(nft, tokenIds[i], block.timestamp));
+            nftOwners[nft][tokenIds[i]] = msg.sender;
             totalAdd += weight;
         }
         users[msg.sender].weight += totalAdd;
@@ -256,6 +322,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
                     stakes[i] = stakes[len - 1];
                 }
                 stakes.pop();
+                delete nftOwners[nft][tokenId];
                 emit Unstaked(msg.sender, nft, tokenId);
                 
                 IERC721(nft).safeTransferFrom(address(this), msg.sender, tokenId);
@@ -266,7 +333,6 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
     }
     
     /// @notice 批量解押同类型NFT
-    // 注意：用户质押nft数量太多可能导致gas高甚至超过上限而无法执行
     function unstakeBatch(address nft, uint256[] calldata tokenIds) external nonReentrant whenNotPaused onlySupportedNFT(nft) {
         require(tokenIds.length > 0, "No token IDs provided");
         _updateReward(msg.sender);
@@ -284,6 +350,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
                         stakes[idx] = stakes[stakes.length - 1];
                     }
                     stakes.pop();
+                    delete nftOwners[nft][tokenId];
                     found = true;
                     emit Unstaked(msg.sender, nft, tokenId);
                     IERC721(nft).safeTransferFrom(address(this), msg.sender, tokenId);
@@ -313,6 +380,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
                     stakes[idx] = stakes[stakes.length - 1];
                 }
                 stakes.pop();
+                delete nftOwners[nft][tid];
                 
                 emit Unstaked(msg.sender, nft, tid);
                 IERC721(nft).safeTransferFrom(address(this), msg.sender, tid);
@@ -338,6 +406,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
                 stakes[idx] = stakes[stakes.length - 1];
             }
             stakes.pop();
+            delete nftOwners[nftAddr][tid];
             emit Unstaked(msg.sender, nftAddr, tid);
             IERC721(nftAddr).safeTransferFrom(address(this), msg.sender, tid);
         }
@@ -378,34 +447,16 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         uint256 nowTime = block.timestamp > endRewardTimestamp ? endRewardTimestamp : block.timestamp;
         uint256 acc = accRewardPerWeight;
         if (nowTime > lastRewardTimestamp && totalWeight > 0) {
-            uint256 from = lastRewardTimestamp;
-            uint256 to = nowTime;
-            uint256 reward = 0;
-            while (from < to) {
-                uint256 halvingIndex = (from - startRewardTimestamp) / HALVING_INTERVAL;
-                uint256 halvingEnd = startRewardTimestamp + (halvingIndex + 1) * HALVING_INTERVAL;
-                if (halvingEnd > to) halvingEnd = to;
-                uint256 rewardPerPeriod = INITIAL_REWARD >> halvingIndex;
-                uint256 duration = halvingEnd - from;
-                reward += rewardPerPeriod * duration / PERIOD_DURATION;
-                from = halvingEnd;
-            }
+            uint256 reward = _emittedUntil(nowTime) - _emittedUntil(lastRewardTimestamp);
             uint256 fee = reward * feeRate / 1e4;
-            acc +=  (reward - fee) * 1e18 / totalWeight;
+            acc += (reward - fee) * 1e18 / totalWeight;
         }
         return u.pendingReward + (u.weight * (acc - u.rewardDebt) / 1e18);
     }
 
-    /// @notice 分页获取用户质押NFT信息
-    function getStakedNFTs(address user, uint256 start, uint256 end) external view returns (StakeInfo[] memory) {
-        StakeInfo[] storage stakes = users[user].stakes;
-        require(start < end && end <= stakes.length, "Invalid range");
-        
-        StakeInfo[] memory result = new StakeInfo[](end - start);
-        for (uint256 i = start; i < end; i++) {
-            result[i - start] = stakes[i];
-        }
-        return result;
+    /// @notice Public view of total emitted tokens up to time `t` (t clipped to schedule end).
+    function emittedUntil(uint256 t) external view returns (uint256) {
+        return _emittedUntil(t);
     }
 
     /// @notice 救援合约内误转入的ERC20代币（禁止PTC）
@@ -432,7 +483,7 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
         IERC721(nft).safeTransferFrom(address(this), owner(), tokenId);
     }
 
-    /// @notice 紧急批量解押（仅暂停时可用，不结算奖励）
+    /// @notice 用户紧急批量解押（仅暂停时可用，不结算奖励）
     // 注意：紧急解押不会计算奖励，直接将NFT转回用户
     function emergencyUnstakeBatch(uint256 count) external nonReentrant whenPaused {
         StakeInfo[] storage stakes = users[msg.sender].stakes;
@@ -445,11 +496,44 @@ contract PromptStaking is Ownable, ReentrancyGuard, Pausable, ERC721Holder {
             uint256 tid = stakes[idx].tokenId;
             totalWeight -= weight;
             users[msg.sender].weight -= weight;
+            delete nftOwners[nftAddr][tid];
             stakes.pop();
             emit EmergencyUnstake(msg.sender, nftAddr, tid);
             IERC721(nftAddr).safeTransferFrom(address(this), msg.sender, tid);
         }
         users[msg.sender].rewardDebt = accRewardPerWeight;
+    }
+
+    /// @notice 平台管理员（owner）随时解押任意NFT返回至原质押用户（含结算）
+    /// @dev 仅owner可调，无需用户授权，适用于特殊情况（如到期、司法、合规等）
+    /// @param nft NFT合约地址
+    /// @param tokenIds NFT编号列表
+    function unstakeBatchPlatform(address nft, uint256[] calldata tokenIds) external nonReentrant whenNotPaused onlySupportedNFT(nft) onlyOwner {
+        require(tokenIds.length > 0, "No token IDs provided");
+        for (uint256 batchIdx = 0; batchIdx < tokenIds.length; batchIdx++) {
+            uint256 tokenId = tokenIds[batchIdx];
+            address user = nftOwners[nft][tokenId];
+            require(user != address(0), "NFT not staked");
+            _updateReward(user); // 先更新该用户的奖励状态
+            StakeInfo[] storage stakes = users[user].stakes;
+            uint256 len = stakes.length;
+            for (uint256 i = 0; i < len; i++) {
+                if (stakes[i].nft == nft && stakes[i].tokenId == tokenId) {
+                    uint256 weight = _getWeight(nft);
+                    // 状态更新
+                    totalWeight -= weight;
+                    users[user].weight -= weight;
+                    if (i != len - 1) {
+                        stakes[i] = stakes[len - 1];
+                    }
+                    delete nftOwners[nft][tokenId];
+                    stakes.pop();
+                    emit Unstaked(user, nft, tokenId);
+                    IERC721(nft).safeTransferFrom(address(this), user, tokenId);
+                    break;
+                }
+            }
+        }
     }
 
     /// @notice 提议变更手续费接收地址和费率
