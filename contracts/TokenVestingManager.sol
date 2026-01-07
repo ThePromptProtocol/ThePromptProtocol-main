@@ -20,7 +20,7 @@ import "./MonthlyVesting.sol";
  *      fees or burn-on-transfer) for production use. For direct transfers the
  *      manager measures the recipient's balance change and will revert if the
  *      beneficiary receives less than the requested amount (to avoid
- *      inconsistent on-chain accounting). 
+ *      inconsistent on-chain accounting).
  */
 contract TokenVestingManager is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
