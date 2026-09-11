@@ -1,0 +1,9 @@
+# 私钥/配置：严禁提交
+.env
+
+# forge 构建产物
+cache/
+out/
+
+# 广播记录：只保留真实广播的（--broadcast），模拟运行（dry-run）的产物不需要留痕
+broadcast/*/*/dry-run/
